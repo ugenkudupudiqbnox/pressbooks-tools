@@ -12,7 +12,7 @@ SERVER_IP="101.53.135.111"
 DB_NAME="pressbooks"
 DB_USER="pressbooks"
 
-# Default random DB password for this run (may be overridden by existing .env)
+# Default random DB password for this run
 DB_PASS_RUN="$(openssl rand -hex 16)"
 
 WP_ADMIN_USER="pbadmin"
@@ -42,15 +42,6 @@ echo "==============================================="
 if [ "$(id -u)" -ne 0 ]; then
   echo "[!] Please run this script as root (or via sudo)."
   exit 1
-fi
-
-### --- IF APP ALREADY EXISTS, REUSE DB PASSWORD FROM .env --- ###
-if [ -f "${APP_DIR}/.env" ]; then
-  EXISTING_DB_PASS="$(grep "^DB_PASSWORD=" "${APP_DIR}/.env" | sed "s/^DB_PASSWORD='\(.*\)'/\1/")" || true
-  if [ -n "${EXISTING_DB_PASS:-}" ]; then
-    echo "[*] Found existing DB password in ${APP_DIR}/.env, reusing."
-    DB_PASS_RUN="$EXISTING_DB_PASS"
-  fi
 fi
 
 ### --- PACKAGE INSTALL --- ###
@@ -139,6 +130,9 @@ else
   echo "  [-] $APP_DIR already exists, skipping clone."
 fi
 
+# Ensure web user owns the app (for composer, wp, dotenv)
+chown -R www-data:www-data "$APP_DIR"
+
 cd "$APP_DIR"
 
 export COMPOSER_ALLOW_SUPERUSER=1
@@ -146,7 +140,7 @@ export COMPOSER_NO_INTERACTION=1
 
 ### --- COMPOSER INSTALL --- ###
 echo "[*] Running composer install (safe to re-run)..."
-composer install --no-dev --prefer-dist --optimize-autoloader
+sudo -u www-data composer install --no-dev --prefer-dist --optimize-autoloader
 
 ### --- INSTALL PRINCEXML --- ###
 echo "[*] Checking PrinceXML..."
@@ -162,52 +156,61 @@ else
   dpkg -i "$PRINCE_DEB" || apt-get install -f -y
 fi
 
-### --- CREATE .env FOR BEDROCK (ONLY IF MISSING) --- ###
-echo "[*] Checking .env file..."
+### --- PREPARE WP-CLI PACKAGE DIR FOR www-data --- ###
+echo "[*] Ensuring wp-cli package directory for www-data..."
 
-if [ ! -f .env ]; then
-  echo "  [+] Creating new .env file..."
+WPCLI_PKG_DIR="/var/www/.wp-cli"
+mkdir -p "${WPCLI_PKG_DIR}/packages"
+chown -R www-data:www-data "${WPCLI_PKG_DIR}"
 
-  # Fetch dotenv-ready salts from Roots API and strip any HTML (keep only KEY='value' lines)
-  SALTS=$(curl -s https://roots.io/salts.html \
-    | sed -n "s/^[[:space:]]*\([A-Z_][A-Z_0-9]*\)='\(.*\)'/\1='\2'/p")
+### --- MANAGE .env VIA wp dotenv --- ###
+echo "[*] Managing .env via wp dotenv..."
 
-  cat > .env <<EOF
-DB_NAME='${DB_NAME}'
-DB_USER='${DB_USER}'
-DB_PASSWORD='${DB_PASS_FINAL}'
-DB_HOST='localhost'
-
-DB_PREFIX='wp_'
-
-# WP / Bedrock paths
-WP_ENV='development'
-WP_HOME='https://${DOMAIN}'
-WP_SITEURL="\${WP_HOME}/wp"
-HTTP_HOST="${DOMAIN}"
-DOMAIN_CURRENT_SITE="${DOMAIN}"
-
-# WordPress Multisite configuration
-WP_ALLOW_MULTISITE=true
-MULTISITE=true
-SUBDOMAIN_INSTALL=false
-PATH_CURRENT_SITE='/'
-SITE_ID_CURRENT_SITE=1
-BLOG_ID_CURRENT_SITE=1
-
-PB_PRINCE_COMMAND='/usr/bin/prince'
-
-# WordPress salts
-${SALTS}
-EOF
-
+# Ensure wp-cli dotenv package is installed (for www-data)
+if ! sudo -u www-data wp package list 2>/dev/null | grep -q "aaemnnosttv/wp-cli-dotenv-command"; then
+  echo "  [+] Installing wp-cli dotenv package..."
+  sudo -u www-data wp package install aaemnnosttv/wp-cli-dotenv-command:^2.0
 else
-  echo "  [-] .env already exists, not modifying."
+  echo "  [-] wp-cli dotenv package already installed."
 fi
 
-### --- FILE PERMISSIONS --- ###
-echo "[*] Setting file permissions (www-data, safe to re-run)..."
+if [ ! -f .env ]; then
+  echo "  [+] Initializing .env from .env.example (if present)..."
+  if [ -f .env.example ]; then
+    sudo -u www-data wp dotenv init --template=.env.example
+  else
+    sudo -u www-data wp dotenv init
+  fi
+  echo "  [+] Generating salts in .env..."
+  sudo -u www-data wp dotenv salts generate
+else
+  echo "  [-] .env already exists, updating values."
+fi
 
+# Set/update all key env vars
+sudo -u www-data wp dotenv set DB_NAME "${DB_NAME}"
+sudo -u www-data wp dotenv set DB_USER "${DB_USER}"
+sudo -u www-data wp dotenv set DB_PASSWORD "${DB_PASS_FINAL}"
+sudo -u www-data wp dotenv set DB_HOST "localhost"
+sudo -u www-data wp dotenv set DB_PREFIX "wp_"
+
+sudo -u www-data wp dotenv set WP_ENV "development"
+sudo -u www-data wp dotenv set WP_HOME "https://${DOMAIN}"
+sudo -u www-data wp dotenv set WP_SITEURL "\${WP_HOME}/wp"
+sudo -u www-data wp dotenv set HTTP_HOST "${DOMAIN}"
+sudo -u www-data wp dotenv set DOMAIN_CURRENT_SITE "${DOMAIN}"
+
+sudo -u www-data wp dotenv set WP_ALLOW_MULTISITE "true"
+sudo -u www-data wp dotenv set MULTISITE "true"
+sudo -u www-data wp dotenv set SUBDOMAIN_INSTALL "false"
+sudo -u www-data wp dotenv set PATH_CURRENT_SITE "/"
+sudo -u www-data wp dotenv set SITE_ID_CURRENT_SITE "1"
+sudo -u www-data wp dotenv set BLOG_ID_CURRENT_SITE "1"
+
+sudo -u www-data wp dotenv set PB_PRINCE_COMMAND "/usr/bin/prince"
+
+### --- FILE PERMISSIONS (FINAL PASS) --- ###
+echo "[*] Ensuring file permissions (www-data, safe to re-run)..."
 chown -R www-data:www-data "$APP_DIR"
 find "$APP_DIR" -type d -exec chmod 755 {} \;
 find "$APP_DIR" -type f -exec chmod 644 {} \;
@@ -362,7 +365,7 @@ else
   NEW_WP_INSTALLED=true
 fi
 
-### --- WP-CLI HELPER (ALWAYS AS www-data, NON-INTERACTIVE) --- ###
+### --- WP-CLI HELPER (ALWAYS AS www-data) --- ###
 wp_cli() {
   sudo -u www-data wp "$@" --path="$WP_PATH" --quiet
 }
@@ -398,32 +401,6 @@ else
   echo "  [+] Activating H5P plugin network-wide..."
   wp_cli plugin activate h5p --network
 fi
-
-# 3) pb-enable-search from GitHub into Bedrock plugins dir
-#PB_ENABLE_SEARCH_DIR="${APP_DIR}/web/app/plugins/pb-enable-search"
-#if [ ! -d "$PB_ENABLE_SEARCH_DIR" ]; then
-#  echo "  [+] Cloning pb-enable-search plugin from GitHub..."
-#  # Disable interactive prompts; if auth is required, this will fail fast
-#  GIT_TERMINAL_PROMPT=0 sudo -u www-data git clone \
-#    https://github.com/pressbooks/pb-enable-search.git "$PB_ENABLE_SEARCH_DIR" || {
-#      echo "  [!] Failed to clone pb-enable-search (maybe repo moved or is private). Skipping."
-#  }
-#else
-#  echo "  [-] pb-enable-search plugin directory already exists."
-#fi
-#
-#if wp_cli plugin is-installed pb-enable-search >/dev/null 2>&1; then
-#  echo "  [-] pb-enable-search plugin already registered."
-#else
-#  echo "  [!] pb-enable-search not visible to wp-cli; check plugin header if needed."
-#fi
-#
-#if wp_cli plugin is-active pb-enable-search --network >/dev/null 2>&1; then
-#  echo "  [-] pb-enable-search plugin already network-active."
-#else
-#  echo "  [+] Activating pb-enable-search plugin network-wide..."
-#  wp_cli plugin activate pb-enable-search --network
-#fi
 
 # 4) user-role-editor
 if wp_cli plugin is-installed user-role-editor >/dev/null 2>&1; then
